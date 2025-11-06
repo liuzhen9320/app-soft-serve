@@ -1,0 +1,133 @@
+From a693cc5aba306682e67f47b8a97265336f1e8f64 Mon Sep 17 00:00:00 2001
+From: arcbjorn <arky.happ@gmail.com>
+Date: Sat, 18 Oct 2025 16:54:43 -0300
+Subject: [PATCH 1/2] fix(ssh): support split key in user create
+
+---
+ pkg/ssh/cmd/user.go | 70 +++++++++++++++++++++++++++------------------
+ 1 file changed, 42 insertions(+), 28 deletions(-)
+
+diff --git a/pkg/ssh/cmd/user.go b/pkg/ssh/cmd/user.go
+index 21981f9cb..a41ed2c21 100644
+--- a/pkg/ssh/cmd/user.go
++++ b/pkg/ssh/cmd/user.go
+@@ -21,34 +21,48 @@ func UserCommand() *cobra.Command {
+ 
+ 	var admin bool
+ 	var key string
+-	userCreateCommand := &cobra.Command{
+-		Use:               "create USERNAME",
+-		Short:             "Create a new user",
+-		Args:              cobra.ExactArgs(1),
+-		PersistentPreRunE: checkIfAdmin,
+-		RunE: func(cmd *cobra.Command, args []string) error {
+-			var pubkeys []ssh.PublicKey
+-			ctx := cmd.Context()
+-			be := backend.FromContext(ctx)
+-			username := args[0]
+-			if key != "" {
+-				pk, _, err := sshutils.ParseAuthorizedKey(key)
+-				if err != nil {
+-					return err
+-				}
+-
+-				pubkeys = []ssh.PublicKey{pk}
+-			}
+-
+-			opts := proto.UserOptions{
+-				Admin:      admin,
+-				PublicKeys: pubkeys,
+-			}
+-
+-			_, err := be.CreateUser(ctx, username, opts)
+-			return err
+-		},
+-	}
++    userCreateCommand := &cobra.Command{
++        Use:               "create USERNAME",
++        Short:             "Create a new user",
++        Args:              cobra.MinimumNArgs(1),
++        PersistentPreRunE: checkIfAdmin,
++        RunE: func(cmd *cobra.Command, args []string) error {
++            var pubkeys []ssh.PublicKey
++            ctx := cmd.Context()
++            be := backend.FromContext(ctx)
++            username := args[0]
++
++            // Reconstruct authorized key value in cases where the SSH command
++            // splitting drops quoting and splits the key across multiple args.
++            // Prefer the -k/--key flag, but append any trailing args to support
++            // inputs like: user create <user> -k ssh-ed25519 AAAA...
++            pubkeyStr := strings.TrimSpace(key)
++            if len(args) > 1 {
++                tail := strings.Join(args[1:], " ")
++                if pubkeyStr != "" {
++                    pubkeyStr = strings.TrimSpace(pubkeyStr + " " + tail)
++                } else {
++                    pubkeyStr = strings.TrimSpace(tail)
++                }
++            }
++
++            if pubkeyStr != "" {
++                pk, _, err := sshutils.ParseAuthorizedKey(pubkeyStr)
++                if err != nil {
++                    return err
++                }
++                pubkeys = []ssh.PublicKey{pk}
++            }
++
++            opts := proto.UserOptions{
++                Admin:      admin,
++                PublicKeys: pubkeys,
++            }
++
++            _, err := be.CreateUser(ctx, username, opts)
++            return err
++        },
++    }
+ 
+ 	userCreateCommand.Flags().BoolVarP(&admin, "admin", "a", false, "make the user an admin")
+ 	userCreateCommand.Flags().StringVarP(&key, "key", "k", "", "add a public key to the user")
+
+From 7c81dcb08dda93abc89133cf5ddadbee24b1b2bd Mon Sep 17 00:00:00 2001
+From: arcbjorn <arky.happ@gmail.com>
+Date: Sat, 18 Oct 2025 16:54:43 -0300
+Subject: [PATCH 2/2] test(ssh): add split-key user create
+
+---
+ .../testdata/user_create_split_key.txtar      | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+ create mode 100644 testscript/testdata/user_create_split_key.txtar
+
+diff --git a/testscript/testdata/user_create_split_key.txtar b/testscript/testdata/user_create_split_key.txtar
+new file mode 100644
+index 000000000..d112d559f
+--- /dev/null
++++ b/testscript/testdata/user_create_split_key.txtar
+@@ -0,0 +1,26 @@
++# vi: set ft=conf
++
++# convert crlf to lf on windows
++[windows] dos2unix info.txt
++
++# start soft serve
++exec soft serve &
++# wait for SSH server to start
++ensureserverrunning SSH_PORT
++
++# create user with split key args (unquoted authorized key)
++soft user create split -k $USER1_AUTHORIZED_KEY
++
++# verify user info shows the key
++soft user info split
++cmpenv stdout info.txt
++
++# stop the server
++[windows] stopserver
++[windows] ! stderr .
++
++-- info.txt --
++Username: split
++Admin: false
++Public keys:
++  $USER1_AUTHORIZED_KEY
